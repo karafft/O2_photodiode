@@ -23,11 +23,83 @@ SLOTS = 3
 MAX_SECONDS = 60
 MAX_FPS = 200
 
+# Nabız / SpO2 hesabı
+VITALS_WINDOW_S = 8
+PULSE_MIN_HZ = 0.7      # 42 atım/dk
+PULSE_MAX_HZ = 3.5      # 210 atım/dk
+MIN_SIGNAL = 200        # bunun altındaki sinyalde nabız dalgası gürültüde kaybolur
+MIN_PEAK_RATIO = 4.0    # nabız tepesi / bant ortalaması
+
 
 def actual_fps(fps):
     """Timer tam bölünmediği için karttaki gerçek hız istenenden biraz farklı."""
     arr = TIM_TICK_HZ // (SLOTS * fps)
     return TIM_TICK_HZ / (SLOTS * arr)
+
+
+def pulse_band(x, fs):
+    """Eğimi alır, sadece nabız bandını (0.7-3.5 Hz) bırakır."""
+    n = len(x)
+    idx = np.arange(n)
+    x = x - np.polyval(np.polyfit(idx, x, 1), idx)
+    spec = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(n, 1 / fs)
+    spec[(freqs < PULSE_MIN_HZ) | (freqs > PULSE_MAX_HZ)] = 0
+    return np.fft.irfft(spec, n)
+
+
+def pulse_peak(x, fs):
+    """Nabız bandındaki en güçlü frekansı ve bant ortalamasına oranını döndürür."""
+    n = len(x)
+    nfft = 8 * n
+    amp = np.abs(np.fft.rfft(x * np.hanning(n), nfft))
+    freqs = np.fft.rfftfreq(nfft, 1 / fs)
+    band = (freqs >= PULSE_MIN_HZ) & (freqs <= PULSE_MAX_HZ)
+    amp_band = amp[band]
+    k = int(np.argmax(amp_band))
+    mean = amp_band.mean()
+    ratio = amp_band[k] / mean if mean > 0 else 0.0
+    return freqs[band][k], ratio
+
+
+def estimate_vitals(red, ir, fs):
+    """
+    red, ir: karanlığı çıkarılmış sinyaller (LED1 = kırmızı, LED2 = kızılötesi).
+    (nabız, spo2, mesaj) döndürür; hesaplanamıyorsa nabız ve spo2 None olur.
+    """
+    need = int(VITALS_WINDOW_S * fs)
+    if len(red) < need:
+        return None, None, "Veri toplanıyor..."
+
+    red = np.asarray(red[-need:], dtype=float)
+    ir = np.asarray(ir[-need:], dtype=float)
+
+    dc_red = red.mean()
+    dc_ir = ir.mean()
+    if dc_red < MIN_SIGNAL or dc_ir < MIN_SIGNAL:
+        return None, None, f"Sinyal zayıf (LED1: {dc_red:.0f}, LED2: {dc_ir:.0f}, en az {MIN_SIGNAL})"
+
+    ac_red = pulse_band(red, fs)
+    ac_ir = pulse_band(ir, fs)
+
+    f_ir, ratio_ir = pulse_peak(ac_ir, fs)
+    f_red, ratio_red = pulse_peak(ac_red, fs)
+
+    # Gerçek nabızda iki kanal aynı frekansta tepe yapar
+    if ratio_ir < MIN_PEAK_RATIO or ratio_red < MIN_PEAK_RATIO or abs(f_ir - f_red) > 0.15:
+        return None, None, "Nabız bulunamadı (parmağı sabit tut)"
+
+    rms_red = ac_red.std()
+    rms_ir = ac_ir.std()
+    if rms_ir == 0:
+        return None, None, "Nabız bulunamadı"
+
+    r = (rms_red / dc_red) / (rms_ir / dc_ir)
+
+    # Yaygın kullanılan doğrusal yaklaşım; bu LED'ler için kalibre edilmedi
+    spo2 = min(100.0, max(0.0, 110.0 - 25.0 * r))
+    bpm = f_ir * 60.0
+    return bpm, spo2, f"R = {r:.2f}"
 
 
 class SerialWorker(QThread):
@@ -190,6 +262,11 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self.save_csv)
         self.btn_save.setStyleSheet("font-weight: bold; background-color: #607D8B; color: white; padding: 10px;")
 
+        self.btn_vitals = QPushButton("NABIZ / SpO2")
+        self.btn_vitals.setCheckable(True)
+        self.btn_vitals.toggled.connect(self.toggle_vitals)
+        self.btn_vitals.setStyleSheet("font-weight: bold; background-color: #9C27B0; color: white; padding: 10px;")
+
         self.status_label = QLabel("Durum: Hazır")
         self.status_label.setStyleSheet("font-weight: bold;")
 
@@ -200,11 +277,33 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.btn_stop)
         controls_layout.addWidget(self.btn_freeze)
         controls_layout.addWidget(self.btn_save)
+        controls_layout.addWidget(self.btn_vitals)
         controls_layout.addWidget(self.status_label)
         controls_layout.addStretch()
         controls_layout.addWidget(self.value_label)
 
         layout.addLayout(controls_layout)
+
+        # Nabız / SpO2 göstergesi (butonla açılır)
+        self.vitals_group = QGroupBox("Nabız / SpO2  (LED1 = kırmızı, LED2 = kızılötesi)")
+        vitals_layout = QHBoxLayout()
+        self.bpm_label = QLabel("Nabız: -- atım/dk")
+        self.bpm_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #D32F2F;")
+        self.spo2_label = QLabel("SpO2: -- %")
+        self.spo2_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #1976D2;")
+        self.vitals_status = QLabel("")
+        vitals_layout.addWidget(self.bpm_label)
+        vitals_layout.addSpacing(40)
+        vitals_layout.addWidget(self.spo2_label)
+        vitals_layout.addSpacing(40)
+        vitals_layout.addWidget(self.vitals_status)
+        vitals_layout.addStretch()
+        self.vitals_group.setLayout(vitals_layout)
+        self.vitals_group.hide()
+        layout.addWidget(self.vitals_group)
+
+        self.vitals_timer = QTimer()
+        self.vitals_timer.timeout.connect(self.update_vitals)
 
         # Grafik
         self.plot_widget = pg.PlotWidget()
@@ -325,6 +424,36 @@ class MainWindow(QMainWindow):
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self.settings_enabled(True)
+
+    @pyqtSlot(bool)
+    def toggle_vitals(self, checked):
+        self.vitals_group.setVisible(checked)
+        if checked:
+            self.update_vitals()
+            self.vitals_timer.start(500)
+        else:
+            self.vitals_timer.stop()
+
+    @pyqtSlot()
+    def update_vitals(self):
+        bpm, spo2, msg = None, None, "Ölçüm çalışmıyor"
+
+        if self.worker and self.worker.isRunning():
+            if self.led_mask() != 3:
+                msg = "İki LED de açık olmalı"
+            else:
+                need = int(VITALS_WINDOW_S * self.fps)
+                dark = np.array(self.buf_dark, dtype=float)[-need:]
+                led1 = np.array(self.buf_led1, dtype=float)[-need:]
+                led2 = np.array(self.buf_led2, dtype=float)[-need:]
+                if len(led1) and max(led1.max(), led2.max()) >= 4090:
+                    msg = "Sinyal doymuş (4095), R3'ü küçült"
+                else:
+                    bpm, spo2, msg = estimate_vitals(led1 - dark, led2 - dark, self.fps)
+
+        self.bpm_label.setText(f"Nabız: {bpm:.0f} atım/dk" if bpm is not None else "Nabız: -- atım/dk")
+        self.spo2_label.setText(f"SpO2: {spo2:.0f} %" if spo2 is not None else "SpO2: -- %")
+        self.vitals_status.setText(msg)
 
     @pyqtSlot()
     def save_csv(self):
