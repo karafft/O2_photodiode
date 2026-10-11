@@ -65,41 +65,48 @@ def pulse_peak(x, fs):
 def estimate_vitals(red, ir, fs):
     """
     red, ir: karanlığı çıkarılmış sinyaller (LED1 = kırmızı, LED2 = kızılötesi).
-    (nabız, spo2, mesaj) döndürür; hesaplanamıyorsa nabız ve spo2 None olur.
+    (nabız, spo2, mesaj, güvenilir) döndürür.
+
+    Sinyal zayıf olsa da hesap yapılır; o durumda güvenilir False gelir ve
+    sayılar gürültüden çıkmış olabilir. Hiç hesaplanamayan değer None olur.
     """
     need = int(VITALS_WINDOW_S * fs)
     if len(red) < need:
-        return None, None, "Veri toplanıyor..."
+        return None, None, "Veri toplanıyor...", False
 
     red = np.asarray(red[-need:], dtype=float)
     ir = np.asarray(ir[-need:], dtype=float)
 
     dc_red = red.mean()
     dc_ir = ir.mean()
-    if dc_red < MIN_SIGNAL or dc_ir < MIN_SIGNAL:
-        return None, None, f"Sinyal zayıf (LED1: {dc_red:.0f}, LED2: {dc_ir:.0f}, en az {MIN_SIGNAL})"
 
     ac_red = pulse_band(red, fs)
     ac_ir = pulse_band(ir, fs)
 
     f_ir, ratio_ir = pulse_peak(ac_ir, fs)
     f_red, ratio_red = pulse_peak(ac_red, fs)
-
-    # Gerçek nabızda iki kanal aynı frekansta tepe yapar
-    if ratio_ir < MIN_PEAK_RATIO or ratio_red < MIN_PEAK_RATIO or abs(f_ir - f_red) > 0.15:
-        return None, None, "Nabız bulunamadı (parmağı sabit tut)"
+    bpm = f_ir * 60.0
 
     rms_red = ac_red.std()
     rms_ir = ac_ir.std()
-    if rms_ir == 0:
-        return None, None, "Nabız bulunamadı"
 
-    r = (rms_red / dc_red) / (rms_ir / dc_ir)
+    # Oran için iki sinyalin de pozitif olması gerek
+    spo2 = None
+    r = None
+    if dc_red > 0 and dc_ir > 0 and rms_ir > 0:
+        r = (rms_red / dc_red) / (rms_ir / dc_ir)
+        # Yaygın kullanılan doğrusal yaklaşım; bu LED'ler için kalibre edilmedi
+        spo2 = min(100.0, max(0.0, 110.0 - 25.0 * r))
 
-    # Yaygın kullanılan doğrusal yaklaşım; bu LED'ler için kalibre edilmedi
-    spo2 = min(100.0, max(0.0, 110.0 - 25.0 * r))
-    bpm = f_ir * 60.0
-    return bpm, spo2, f"R = {r:.2f}"
+    if dc_red < MIN_SIGNAL or dc_ir < MIN_SIGNAL:
+        msg = f"Sinyal zayıf (LED1: {dc_red:.0f}, LED2: {dc_ir:.0f}, en az {MIN_SIGNAL})"
+        return bpm, spo2, msg, False
+
+    # Gerçek nabızda iki kanal aynı frekansta tepe yapar
+    if ratio_ir < MIN_PEAK_RATIO or ratio_red < MIN_PEAK_RATIO or abs(f_ir - f_red) > 0.15:
+        return bpm, spo2, "Nabız net değil (parmağı sabit tut)", False
+
+    return bpm, spo2, f"R = {r:.2f}", True
 
 
 class SerialWorker(QThread):
@@ -436,7 +443,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def update_vitals(self):
-        bpm, spo2, msg = None, None, "Ölçüm çalışmıyor"
+        bpm, spo2, msg, reliable = None, None, "Ölçüm çalışmıyor", False
 
         if self.worker and self.worker.isRunning():
             if self.led_mask() != 3:
@@ -449,10 +456,18 @@ class MainWindow(QMainWindow):
                 if len(led1) and max(led1.max(), led2.max()) >= 4090:
                     msg = "Sinyal doymuş (4095), R3'ü küçült"
                 else:
-                    bpm, spo2, msg = estimate_vitals(led1 - dark, led2 - dark, self.fps)
+                    bpm, spo2, msg, reliable = estimate_vitals(led1 - dark, led2 - dark, self.fps)
 
-        self.bpm_label.setText(f"Nabız: {bpm:.0f} atım/dk" if bpm is not None else "Nabız: -- atım/dk")
-        self.spo2_label.setText(f"SpO2: {spo2:.0f} %" if spo2 is not None else "SpO2: -- %")
+        # Güvenilmez değerler de yazılır, ama gri ve "~" ile
+        mark = "" if reliable else "~"
+        self.bpm_label.setText(f"Nabız: {mark}{bpm:.0f} atım/dk" if bpm is not None else "Nabız: -- atım/dk")
+        self.spo2_label.setText(f"SpO2: {mark}{spo2:.0f} %" if spo2 is not None else "SpO2: -- %")
+        self.bpm_label.setStyleSheet(
+            f"font-size: 22px; font-weight: bold; color: {'#D32F2F' if reliable else '#9E9E9E'};")
+        self.spo2_label.setStyleSheet(
+            f"font-size: 22px; font-weight: bold; color: {'#1976D2' if reliable else '#9E9E9E'};")
+        if bpm is not None and not reliable:
+            msg += " - değerler güvenilir değil"
         self.vitals_status.setText(msg)
 
     @pyqtSlot()
